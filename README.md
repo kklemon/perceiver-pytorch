@@ -99,6 +99,8 @@ logits = model(seq, mask = mask) # (1, 512, 20000)
 
 ## Experimental
 
+### Bottom-up Attention
+
 I have also included a version of Perceiver that includes bottom-up (in addition to top-down) attention, using the same scheme as presented in the original <a href="https://arxiv.org/abs/1810.00825">Set Transformers</a> paper as the <a href="https://github.com/lucidrains/isab-pytorch">Induced Set Attention Block</a>.
 
 You simply have to change the above import to
@@ -106,6 +108,17 @@ You simply have to change the above import to
 ```python
 from perceiver_pytorch.experimental import Perceiver
 ```
+
+### ReZero Normalization
+
+https://arxiv.org/abs/2003.04887
+
+Proposes to scale each (residual) block of a deep neural net with a learnable scalar initialized to zero to improve 
+convergence, particularly for very deep networks. For attention-based models it seems to alleviate the need for
+normalization and thus warmup steps.
+
+ReZero is implemented for the `Perceiver` and `PerceiverIO` class and can be activated by setting the `rezero`-parameter
+to `True`.
 
 ## Citations
 
