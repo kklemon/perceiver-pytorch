@@ -127,6 +127,17 @@ class Attention(nn.Module):
         out = rearrange(out, '(b h) n d -> b n (h d)', h = h)
         return self.to_out(out)
 
+
+class LearnedScale(nn.Module):
+    def __init__(self, init_scale: float = 0.0):
+        super().__init__()
+
+        self.alpha = nn.Parameter(torch.tensor(init_scale))
+
+    def forward(self, x):
+        return self.alpha * x
+
+
 # main class
 
 class PerceiverIO(nn.Module):
@@ -145,6 +156,7 @@ class PerceiverIO(nn.Module):
         latent_dim_head = 64,
         weight_tie_layers = False,
         decoder_ff = False,
+        rezero=False,
         seq_dropout_prob = 0.
     ):
         super().__init__()
@@ -156,13 +168,17 @@ class PerceiverIO(nn.Module):
         else:
             self.latents = None
 
+        norm_fn = lambda dim, fn, **kwargs: fn if rezero else PreNorm(dim, fn, **kwargs)
+        scale_fn = LearnedScale if rezero else nn.Identity
+
         self.cross_attend_blocks = nn.ModuleList([
-            PreNorm(latent_dim, Attention(latent_dim, dim, heads = cross_heads, dim_head = cross_dim_head), context_dim = dim),
-            PreNorm(latent_dim, FeedForward(latent_dim))
+            norm_fn(latent_dim, Attention(latent_dim, dim, heads = cross_heads, dim_head = cross_dim_head), context_dim = dim),
+            norm_fn(latent_dim, FeedForward(latent_dim)),
+            scale_fn()
         ])
 
-        get_latent_attn = lambda: PreNorm(latent_dim, Attention(latent_dim, heads = latent_heads, dim_head = latent_dim_head))
-        get_latent_ff = lambda: PreNorm(latent_dim, FeedForward(latent_dim))
+        get_latent_attn = lambda: norm_fn(latent_dim, Attention(latent_dim, heads = latent_heads, dim_head = latent_dim_head))
+        get_latent_ff = lambda: norm_fn(latent_dim, FeedForward(latent_dim))
         get_latent_attn, get_latent_ff = map(cache_fn, (get_latent_attn, get_latent_ff))
 
         self.layers = nn.ModuleList([])
@@ -171,11 +187,13 @@ class PerceiverIO(nn.Module):
         for i in range(depth):
             self.layers.append(nn.ModuleList([
                 get_latent_attn(**cache_args),
-                get_latent_ff(**cache_args)
+                get_latent_ff(**cache_args),
+                scale_fn()
             ]))
 
-        self.decoder_cross_attn = PreNorm(queries_dim, Attention(queries_dim, latent_dim, heads = cross_heads, dim_head = cross_dim_head), context_dim = latent_dim)
-        self.decoder_ff = PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
+        self.decoder_cross_attn = norm_fn(queries_dim, Attention(queries_dim, latent_dim, heads = cross_heads, dim_head = cross_dim_head), context_dim = latent_dim)
+        self.decoder_ff = norm_fn(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
+        self.decoder_scale = scale_fn()
 
         self.to_logits = nn.Linear(queries_dim, logits_dim) if exists(logits_dim) else nn.Identity()
 
@@ -201,7 +219,7 @@ class PerceiverIO(nn.Module):
                                  'forward()')
             x = repeat(self.latents, 'n d -> b n d', b = b)
 
-        cross_attn, cross_ff = self.cross_attend_blocks
+        cross_attn, cross_ff, cross_scale = self.cross_attend_blocks
 
         # structured dropout (as done in perceiver AR https://arxiv.org/abs/2202.07765)
 
@@ -210,14 +228,14 @@ class PerceiverIO(nn.Module):
 
         # cross attention only happens once for Perceiver IO
 
-        x = cross_attn(x, context = data, mask = mask) + x
-        x = cross_ff(x) + x
+        x = cross_scale(cross_attn(x, context = data, mask = mask)) + x
+        x = cross_scale(cross_ff(x)) + x
 
         # layers
 
-        for self_attn, self_ff in self.layers:
-            x = self_attn(x) + x
-            x = self_ff(x) + x
+        for self_attn, self_ff, self_scale in self.layers:
+            x = self_scale(self_attn(x)) + x
+            x = self_scale(self_ff(x)) + x
 
         if not exists(queries):
             return x
@@ -229,12 +247,12 @@ class PerceiverIO(nn.Module):
 
         # cross attend from decoder queries to latents
         
-        latents = self.decoder_cross_attn(queries, context = x)
+        latents = self.decoder_scale(self.decoder_cross_attn(queries, context = x))
 
         # optional decoder feedforward
 
         if exists(self.decoder_ff):
-            latents = latents + self.decoder_ff(latents)
+            latents = latents + self.decoder_scale(self.decoder_ff(latents))
 
         # final linear out
 

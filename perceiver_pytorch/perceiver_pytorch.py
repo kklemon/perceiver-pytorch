@@ -119,6 +119,17 @@ class Attention(nn.Module):
         out = rearrange(out, '(b h) n d -> b n (h d)', h = h)
         return self.to_out(out)
 
+
+class LearnedScale(nn.Module):
+    def __init__(self, init_scale: float = 0.0):
+        super().__init__()
+
+        self.alpha = nn.Parameter(torch.tensor(init_scale))
+
+    def forward(self, x):
+        return self.alpha * x
+
+
 # main class
 
 class Perceiver(nn.Module):
@@ -142,7 +153,8 @@ class Perceiver(nn.Module):
         weight_tie_layers = False,
         fourier_encode_data = True,
         self_per_cross_attn = 1,
-        final_classifier_head = True
+        final_classifier_head = True,
+        rezero=False,
     ):
         """The shape of the final attention mechanism will be:
         depth * (cross attention -> self_per_cross_attn * self attention)
@@ -173,6 +185,8 @@ class Perceiver(nn.Module):
               if you are fourier encoding the data yourself.
           self_per_cross_attn: Number of self attention blocks per cross attn.
           final_classifier_head: mean pool and project embeddings to number of classes (num_classes) at the end
+          rezero: Whether to use ReZero (https://arxiv.org/abs/2003.04887) normalization. If set to True,
+            no LayerNorm will be applied.
         """
         super().__init__()
         self.input_axis = input_axis
@@ -190,12 +204,15 @@ class Perceiver(nn.Module):
         else:
             self.latents = None
 
-        get_cross_attn = lambda: PreNorm(latent_dim, Attention(latent_dim, input_dim, heads = cross_heads, dim_head = cross_dim_head, dropout = attn_dropout), context_dim = input_dim)
-        get_cross_ff = lambda: PreNorm(latent_dim, FeedForward(latent_dim, dropout = ff_dropout))
-        get_latent_attn = lambda: PreNorm(latent_dim, Attention(latent_dim, heads = latent_heads, dim_head = latent_dim_head, dropout = attn_dropout))
-        get_latent_ff = lambda: PreNorm(latent_dim, FeedForward(latent_dim, dropout = ff_dropout))
+        norm_fn = lambda dim, fn, **kwargs: fn if rezero else PreNorm(dim, fn, **kwargs)
+
+        get_cross_attn = lambda: norm_fn(latent_dim, Attention(latent_dim, input_dim, heads = cross_heads, dim_head = cross_dim_head, dropout = attn_dropout), context_dim = input_dim)
+        get_cross_ff = lambda: norm_fn(latent_dim, FeedForward(latent_dim, dropout = ff_dropout))
+        get_latent_attn = lambda: norm_fn(latent_dim, Attention(latent_dim, heads = latent_heads, dim_head = latent_dim_head, dropout = attn_dropout))
+        get_latent_ff = lambda: norm_fn(latent_dim, FeedForward(latent_dim, dropout = ff_dropout))
 
         get_cross_attn, get_cross_ff, get_latent_attn, get_latent_ff = map(cache_fn, (get_cross_attn, get_cross_ff, get_latent_attn, get_latent_ff))
+        get_scale = LearnedScale if rezero else nn.Identity
 
         self.layers = nn.ModuleList([])
         for i in range(depth):
@@ -207,13 +224,15 @@ class Perceiver(nn.Module):
             for block_ind in range(self_per_cross_attn):
                 self_attns.append(nn.ModuleList([
                     get_latent_attn(**cache_args, key = block_ind),
-                    get_latent_ff(**cache_args, key = block_ind)
+                    get_latent_ff(**cache_args, key = block_ind),
+                    get_scale()
                 ]))
 
             self.layers.append(nn.ModuleList([
                 get_cross_attn(**cache_args),
                 get_cross_ff(**cache_args),
-                self_attns
+                self_attns,
+                get_scale()
             ]))
 
         self.to_logits = nn.Sequential(
@@ -262,13 +281,13 @@ class Perceiver(nn.Module):
 
         # layers
 
-        for cross_attn, cross_ff, self_attns in self.layers:
-            x = cross_attn(x, context = data, mask = mask) + x
-            x = cross_ff(x) + x
+        for cross_attn, cross_ff, self_attns, cross_scale in self.layers:
+            x = cross_scale(cross_attn(x, context = data, mask = mask)) + x
+            x = cross_scale(cross_ff(x)) + x
 
-            for self_attn, self_ff in self_attns:
-                x = self_attn(x) + x
-                x = self_ff(x) + x
+            for self_attn, self_ff, self_scale in self_attns:
+                x = self_scale(self_attn(x)) + x
+                x = self_scale(self_ff(x)) + x
 
         # allow for fetching embeddings
 
