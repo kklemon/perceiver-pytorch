@@ -150,7 +150,11 @@ class PerceiverIO(nn.Module):
         super().__init__()
         self.seq_dropout_prob = seq_dropout_prob
 
-        self.latents = nn.Parameter(torch.randn(num_latents, latent_dim))
+        self.latent_dim = latent_dim
+        if num_latents:
+            self.latents = nn.Parameter(torch.randn(num_latents, latent_dim))
+        else:
+            self.latents = None
 
         self.cross_attend_blocks = nn.ModuleList([
             PreNorm(latent_dim, Attention(latent_dim, dim, heads = cross_heads, dim_head = cross_dim_head), context_dim = dim),
@@ -179,11 +183,23 @@ class PerceiverIO(nn.Module):
         self,
         data,
         mask = None,
-        queries = None
+        queries = None,
+        latents = None
     ):
         b, *_, device = *data.shape, data.device
 
-        x = repeat(self.latents, 'n d -> b n d', b = b)
+        if latents is not None:
+            if latents.ndim == 2:
+                latents = repeat(latents, 'n d -> b n d', b=b)
+            if latents.ndim != 3 or latents.shape[0] != b or latents.shape[-1] != self.latent_dim:
+                raise ValueError(f'Expected provided latents to have dimensions ({b}, n, {self.latent_dim}) or '
+                                 f'(n, {self.latent_dim}) but found {tuple(latents.shape)}')
+            x = latents
+        else:
+            if self.latents is None:
+                raise ValueError('Module was initialized without learnable latents but no latents provided to '
+                                 'forward()')
+            x = repeat(self.latents, 'n d -> b n d', b = b)
 
         cross_attn, cross_ff = self.cross_attend_blocks
 

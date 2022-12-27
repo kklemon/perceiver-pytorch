@@ -157,6 +157,8 @@ class Perceiver(nn.Module):
           input_axis: Number of axes for input data (2 for images, 3 for video)
           num_latents: Number of latents, or induced set points, or centroids.
               Different papers giving it different names.
+              If None, no latents will be initialized and the latents have to be explicitly provided
+              in the forward()-function.
           latent_dim: Latent dimension.
           cross_heads: Number of heads for cross attention. Paper said 1.
           latent_heads: Number of heads for latent self attention, 8.
@@ -181,7 +183,12 @@ class Perceiver(nn.Module):
         fourier_channels = (input_axis * ((num_freq_bands * 2) + 1)) if fourier_encode_data else 0
         input_dim = fourier_channels + input_channels
 
-        self.latents = nn.Parameter(torch.randn(num_latents, latent_dim))
+        self.latent_dim = latent_dim
+
+        if num_latents:
+            self.latents = nn.Parameter(torch.randn(num_latents, latent_dim))
+        else:
+            self.latents = None
 
         get_cross_attn = lambda: PreNorm(latent_dim, Attention(latent_dim, input_dim, heads = cross_heads, dim_head = cross_dim_head, dropout = attn_dropout), context_dim = input_dim)
         get_cross_ff = lambda: PreNorm(latent_dim, FeedForward(latent_dim, dropout = ff_dropout))
@@ -219,7 +226,8 @@ class Perceiver(nn.Module):
         self,
         data,
         mask = None,
-        return_embeddings = False
+        return_embeddings = False,
+        latents = None
     ):
         b, *axis, _, device, dtype = *data.shape, data.device, data.dtype
         assert len(axis) == self.input_axis, 'input data must have the right number of axis'
@@ -239,7 +247,18 @@ class Perceiver(nn.Module):
 
         data = rearrange(data, 'b ... d -> b (...) d')
 
-        x = repeat(self.latents, 'n d -> b n d', b = b)
+        if latents is not None:
+            if latents.ndim == 2:
+                latents = repeat(latents, 'n d -> b n d', b=b)
+            if latents.ndim != 3 or latents.shape[0] != b or latents.shape[-1] != self.latent_dim:
+                raise ValueError(f'Expected provided latents to have dimensions ({b}, n, {self.latent_dim}) or '
+                                 f'(n, {self.latent_dim}) but found {tuple(latents.shape)}')
+            x = latents
+        else:
+            if self.latents is None:
+                raise ValueError('Module was initialized without learnable latents but no latents provided to '
+                                 'forward()')
+            x = repeat(self.latents, 'n d -> b n d', b=b)
 
         # layers
 
