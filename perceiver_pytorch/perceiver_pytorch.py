@@ -120,7 +120,7 @@ class Attention(nn.Module):
         out = self.to_out(out)
 
         if return_attn_weights:
-            return out, attn
+            return out, rearrange(attn, '(b h) n d -> b h n d', h=h)
 
         return out
 
