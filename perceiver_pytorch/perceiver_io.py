@@ -103,7 +103,7 @@ class Attention(nn.Module):
         self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias = False)
         self.to_out = nn.Linear(inner_dim, query_dim)
 
-    def forward(self, x, context = None, mask = None):
+    def forward(self, x, context=None, mask=None, return_attn_weights=False):
         h = self.heads
 
         q = self.to_q(x)
@@ -125,7 +125,12 @@ class Attention(nn.Module):
 
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h = h)
-        return self.to_out(out)
+        out = self.to_out(out)
+
+        if return_attn_weights:
+            return out, attn
+
+        return out
 
 
 class LearnedScale(nn.Module):
