@@ -1,5 +1,6 @@
 from math import pi, log
 from functools import wraps
+from typing import Optional, Union, List, Dict, Any
 
 import torch
 from torch import nn, einsum
@@ -162,7 +163,8 @@ class PerceiverIO(nn.Module):
         weight_tie_layers = False,
         decoder_ff = False,
         rezero=False,
-        seq_dropout_prob = 0.
+        seq_dropout_prob = 0.0,
+        cross_attn_interval: Optional[Union[int, List[int]]] = None,
     ):
         super().__init__()
         self.seq_dropout_prob = seq_dropout_prob
@@ -176,21 +178,37 @@ class PerceiverIO(nn.Module):
         norm_fn = lambda dim, fn, **kwargs: fn if rezero else PreNorm(dim, fn, **kwargs)
         scale_fn = LearnedScale if rezero else nn.Identity
 
-        self.cross_attend_blocks = nn.ModuleList([
-            norm_fn(latent_dim, Attention(latent_dim, dim, heads = cross_heads, dim_head = cross_dim_head), context_dim = dim),
-            norm_fn(latent_dim, FeedForward(latent_dim)),
-            scale_fn()
-        ])
-
         get_latent_attn = lambda: norm_fn(latent_dim, Attention(latent_dim, heads = latent_heads, dim_head = latent_dim_head))
         get_latent_ff = lambda: norm_fn(latent_dim, FeedForward(latent_dim))
         get_latent_attn, get_latent_ff = map(cache_fn, (get_latent_attn, get_latent_ff))
 
-        self.layers = nn.ModuleList([])
+        self.self_attn_layers = nn.ModuleList([])
+        self.cross_attn_layers = nn.ModuleList([])
+
         cache_args = {'_cache': weight_tie_layers}
 
+        if cross_attn_interval is None:
+            cross_attn_indices = [0]
+        elif isinstance(cross_attn_interval, int):
+            assert cross_attn_interval > 1
+            cross_attn_indices = list(range(0, depth, cross_attn_interval))
+        elif isinstance(cross_attn_interval, list):
+            assert max(cross_attn_interval) < depth and min(cross_attn_interval) >= 0
+            cross_attn_indices = cross_attn_interval
+        else:
+            raise ValueError
+
         for i in range(depth):
-            self.layers.append(nn.ModuleList([
+            if i in cross_attn_indices:
+                self.cross_attn_layers.append(nn.ModuleList([
+                    norm_fn(latent_dim, Attention(latent_dim, dim, heads = cross_heads, dim_head = cross_dim_head), context_dim = dim),
+                    norm_fn(latent_dim, FeedForward(latent_dim)),
+                    scale_fn()
+                ]))
+            else:
+                self.cross_attn_layers.append(None)
+
+            self.self_attn_layers.append(nn.ModuleList([
                 get_latent_attn(**cache_args),
                 get_latent_ff(**cache_args),
                 scale_fn()
@@ -224,21 +242,17 @@ class PerceiverIO(nn.Module):
                                  'forward()')
             x = repeat(self.latents, 'n d -> b n d', b = b)
 
-        cross_attn, cross_ff, cross_scale = self.cross_attend_blocks
-
         # structured dropout (as done in perceiver AR https://arxiv.org/abs/2202.07765)
 
         if self.training and self.seq_dropout_prob > 0.:
             data, mask = dropout_seq(data, mask, self.seq_dropout_prob)
 
-        # cross attention only happens once for Perceiver IO
+        for i, (self_attn, self_ff, self_scale) in enumerate(self.self_attn_layers):
+            if self.cross_attn_layers[i] is not None:
+                cross_attn, cross_ff, cross_scale = self.cross_attn_layers[i]
+                x = cross_scale(cross_attn(x, context=data, mask=mask)) + x
+                x = cross_scale(cross_ff(x)) + x
 
-        x = cross_scale(cross_attn(x, context = data, mask = mask)) + x
-        x = cross_scale(cross_ff(x)) + x
-
-        # layers
-
-        for self_attn, self_ff, self_scale in self.layers:
             x = self_scale(self_attn(x)) + x
             x = self_scale(self_ff(x)) + x
 
