@@ -190,7 +190,7 @@ class PerceiverIO(nn.Module):
         if cross_attn_interval is None:
             cross_attn_indices = [0]
         elif isinstance(cross_attn_interval, int):
-            assert cross_attn_interval > 1
+            assert cross_attn_interval >= 1
             cross_attn_indices = list(range(0, depth, cross_attn_interval))
         elif isinstance(cross_attn_interval, list):
             assert max(cross_attn_interval) < depth and min(cross_attn_interval) >= 0
