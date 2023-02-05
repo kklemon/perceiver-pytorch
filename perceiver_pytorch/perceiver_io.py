@@ -255,7 +255,11 @@ class PerceiverIO(nn.Module):
         # structured dropout (as done in perceiver AR https://arxiv.org/abs/2202.07765)
 
         if self.training and self.seq_dropout_prob > 0.:
-            data, mask = dropout_seq(data, mask, self.seq_dropout_prob)
+            if isinstance(data, (tuple, list)):
+                data, mask = zip(*[dropout_seq(datum, maskum, self.seq_dropout_prob)
+                                   for datum, maskum in zip(data, mask)])
+            else:
+                data, mask = dropout_seq(data, mask, self.seq_dropout_prob)
 
         for i, (self_attn, self_ff, self_scale) in enumerate(self.self_attn_layers):
             if self.cross_attn_layers[i] is not None:
@@ -330,3 +334,12 @@ class PerceiverLM(nn.Module):
 
         logits = self.perceiver_io(x, mask = mask, queries = x)
         return logits
+
+
+if __name__ == '__main__':
+    data = [torch.randn(4, 32, 64)] * 2
+    mask = [torch.ones(4, 32, dtype=bool)] * 2
+
+    model = PerceiverIO(depth=2, dim=64, latent_dim=128, queries_dim=16, cross_attn_interval=[0, 1], seq_dropout_prob=0.25)
+
+    model(data, mask=mask)
