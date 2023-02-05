@@ -1,12 +1,10 @@
-from math import pi, log
-from functools import wraps
-from typing import Optional, Union, List, Dict, Any
-
 import torch
-from torch import nn, einsum
 import torch.nn.functional as F
 
+from torch import nn, einsum
 from einops import rearrange, repeat
+from functools import wraps
+from typing import Optional, Union, List
 
 # helpers
 
@@ -188,18 +186,18 @@ class PerceiverIO(nn.Module):
         cache_args = {'_cache': weight_tie_layers}
 
         if cross_attn_interval is None:
-            cross_attn_indices = [0]
+            self.cross_attn_indices = [0]
         elif isinstance(cross_attn_interval, int):
             assert cross_attn_interval >= 1
-            cross_attn_indices = list(range(0, depth, cross_attn_interval))
+            self.cross_attn_indices = list(range(0, depth, cross_attn_interval))
         elif isinstance(cross_attn_interval, list):
             assert max(cross_attn_interval) < depth and min(cross_attn_interval) >= 0
-            cross_attn_indices = cross_attn_interval
+            self.cross_attn_indices = cross_attn_interval
         else:
             raise ValueError
 
         for i in range(depth):
-            if i in cross_attn_indices:
+            if i in self.cross_attn_indices:
                 self.cross_attn_layers.append(nn.ModuleList([
                     norm_fn(latent_dim, Attention(latent_dim, dim, heads = cross_heads, dim_head = cross_dim_head), context_dim = dim),
                     norm_fn(latent_dim, FeedForward(latent_dim)),
@@ -227,7 +225,19 @@ class PerceiverIO(nn.Module):
         queries = None,
         latents = None
     ):
-        b, *_, device = *data.shape, data.device
+        if isinstance(data, (tuple, list)):
+            assert len(data) == len(self.cross_attn_indices)
+            if mask is None:
+                mask = [None] * len(self.cross_attn_indices)
+            else:
+                assert len(mask) == len(self.cross_attn_indices)
+
+            b, *_, device = *data[0].shape, data[0].device
+        else:
+            data = [data] * len(self.cross_attn_indices)
+            mask = [mask] * len(self.cross_attn_indices)
+
+            b, *_, device = *data.shape, data.device
 
         if latents is not None:
             if latents.ndim == 2:
@@ -249,12 +259,19 @@ class PerceiverIO(nn.Module):
 
         for i, (self_attn, self_ff, self_scale) in enumerate(self.self_attn_layers):
             if self.cross_attn_layers[i] is not None:
+                # Non-destructive popping
+                datum, *data = data
+                maskum, *mask = mask
+
                 cross_attn, cross_ff, cross_scale = self.cross_attn_layers[i]
-                x = cross_scale(cross_attn(x, context=data, mask=mask)) + x
+                x = cross_scale(cross_attn(x, context=datum, mask=maskum)) + x
                 x = cross_scale(cross_ff(x)) + x
 
             x = self_scale(self_attn(x)) + x
             x = self_scale(self_ff(x)) + x
+
+        # Data and mask list should have been fully consumed
+        assert not data and not mask
 
         if not exists(queries):
             return x
