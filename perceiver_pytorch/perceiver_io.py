@@ -196,10 +196,17 @@ class PerceiverIO(nn.Module):
         else:
             raise ValueError
 
+        if isinstance(dim, (list, tuple)):
+            assert len(dim) == len(self.cross_attn_indices)
+            self.dims = dims = dim
+        else:
+            self.dims = dims = [dim] * self.cross_attn_indices
+
         for i in range(depth):
             if i in self.cross_attn_indices:
+                dim, *dims = dims
                 self.cross_attn_layers.append(nn.ModuleList([
-                    norm_fn(latent_dim, Attention(latent_dim, dim, heads = cross_heads, dim_head = cross_dim_head), context_dim = dim),
+                    norm_fn(latent_dim, Attention(latent_dim, dim, heads=cross_heads, dim_head=cross_dim_head), context_dim=dim),
                     norm_fn(latent_dim, FeedForward(latent_dim)),
                     scale_fn()
                 ]))
