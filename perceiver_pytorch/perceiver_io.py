@@ -279,10 +279,10 @@ class PerceiverIO(nn.Module):
 
             b, *_, device = *data[0].shape, data[0].device
         else:
+            b, *_, device = *data.shape, data.device
+
             data = [data] * len(self.cross_attn_indices)
             mask = [mask] * len(self.cross_attn_indices)
-
-            b, *_, device = *data.shape, data.device
 
         if latents is not None:
             if latents.ndim == 2:
