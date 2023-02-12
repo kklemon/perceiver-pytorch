@@ -6,13 +6,14 @@ from einops import rearrange, repeat
 from functools import wraps
 from typing import Optional, Union, List
 
-# helpers
 
 def exists(val):
     return val is not None
 
+
 def default(val, d):
     return val if exists(val) else d
+
 
 def cache_fn(f):
     cache = None
@@ -27,7 +28,6 @@ def cache_fn(f):
         return cache
     return cached_fn
 
-# structured dropout, more effective than traditional attention dropouts
 
 def dropout_seq(seq, mask, dropout):
     b, n, *_, device = *seq.shape, seq.device
@@ -54,7 +54,32 @@ def dropout_seq(seq, mask, dropout):
 
     return seq, mask
 
-# helper classes
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, max_seq_len, *, device):
+        seq = torch.arange(max_seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = einsum("i , j -> i j", seq, self.inv_freq)
+        return torch.cat((freqs, freqs), dim=-1)
+
+
+def rotate_half(x):
+    x = rearrange(x, "... (j d) -> ... j d", j=2)
+    x1, x2 = x.unbind(dim=-2)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(pos, t):
+    seq_len, rotate_dim = t.shape[-2], pos.shape[-1]
+    pos = pos[..., -seq_len:, :]
+    t, t_pass = t[..., :rotate_dim], t[..., rotate_dim:]
+    t = (t * pos.cos()) + (rotate_half(t) * pos.sin())
+    return torch.cat((t, t_pass), dim=-1)
+
 
 class PreNorm(nn.Module):
     def __init__(self, dim, fn, context_dim = None):
@@ -73,10 +98,12 @@ class PreNorm(nn.Module):
 
         return self.fn(x, **kwargs)
 
+
 class GEGLU(nn.Module):
     def forward(self, x):
         x, gates = x.chunk(2, dim = -1)
         return x * F.gelu(gates)
+
 
 class FeedForward(nn.Module):
     def __init__(self, dim, mult = 4):
@@ -90,6 +117,7 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+
 class Attention(nn.Module):
     def __init__(self, query_dim, context_dim = None, heads = 8, dim_head = 64):
         super().__init__()
@@ -102,16 +130,20 @@ class Attention(nn.Module):
         self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias = False)
         self.to_out = nn.Linear(inner_dim, query_dim)
 
-    def forward(self, x, context=None, mask=None, return_attn_weights=False):
+    def forward(self, x, context=None, mask=None, rotary_pos_emb=None, return_attn_weights=False):
         h = self.heads
+        context = default(context, x)
 
         q = self.to_q(x)
-        context = default(context, x)
-        k, v = self.to_kv(context).chunk(2, dim = -1)
+        k, v = self.to_kv(context).chunk(2, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        q = q * self.scale
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h = h), (q, k, v))
+        if exists(rotary_pos_emb):
+            q = apply_rotary_pos_emb(rotary_pos_emb, q)
+            k = apply_rotary_pos_emb(rotary_pos_emb, k)
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        sim = einsum('b i d, b j d -> b i j', q, k)
 
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
@@ -162,6 +194,7 @@ class PerceiverIO(nn.Module):
         decoder_ff = False,
         rezero=False,
         seq_dropout_prob = 0.0,
+        rotary_pos_emb = False,
         cross_attn_interval: Optional[Union[int, List[int]]] = None,
     ):
         super().__init__()
@@ -179,6 +212,11 @@ class PerceiverIO(nn.Module):
         get_latent_attn = lambda: norm_fn(latent_dim, Attention(latent_dim, heads = latent_heads, dim_head = latent_dim_head))
         get_latent_ff = lambda: norm_fn(latent_dim, FeedForward(latent_dim))
         get_latent_attn, get_latent_ff = map(cache_fn, (get_latent_attn, get_latent_ff))
+
+        if rotary_pos_emb:
+            self.rotary_pos_emb = RotaryEmbedding(dim=max(32, latent_dim_head // 2))
+        else:
+            self.rotary_pos_emb = None
 
         self.self_attn_layers = nn.ModuleList([])
         self.cross_attn_layers = nn.ModuleList([])
@@ -259,6 +297,11 @@ class PerceiverIO(nn.Module):
                                  'forward()')
             x = repeat(self.latents, 'n d -> b n d', b = b)
 
+        if self.rotary_pos_emb:
+            rotary_pos_emb = self.rotary_pos_emb(max(t.shape[1] for t in data + [x]), device=device)
+        else:
+            rotary_pos_emb = None
+
         # structured dropout (as done in perceiver AR https://arxiv.org/abs/2202.07765)
 
         if self.training and self.seq_dropout_prob > 0.:
@@ -275,10 +318,10 @@ class PerceiverIO(nn.Module):
                 maskum, *mask = mask
 
                 cross_attn, cross_ff, cross_scale = self.cross_attn_layers[i]
-                x = cross_scale(cross_attn(x, context=datum, mask=maskum)) + x
+                x = cross_scale(cross_attn(x, context=datum, mask=maskum, rotary_pos_emb=rotary_pos_emb)) + x
                 x = cross_scale(cross_ff(x)) + x
 
-            x = self_scale(self_attn(x)) + x
+            x = self_scale(self_attn(x, rotary_pos_emb=rotary_pos_emb)) + x
             x = self_scale(self_ff(x)) + x
 
         # Data and mask list should have been fully consumed
@@ -294,7 +337,7 @@ class PerceiverIO(nn.Module):
 
         # cross attend from decoder queries to latents
         
-        latents = self.decoder_scale(self.decoder_cross_attn(queries, context = x))
+        latents = self.decoder_scale(self.decoder_cross_attn(queries, context=x, rotary_pos_emb=rotary_pos_emb))
 
         # optional decoder feedforward
 
@@ -344,9 +387,12 @@ class PerceiverLM(nn.Module):
 
 
 if __name__ == '__main__':
-    data = [torch.randn(4, 32, 64)] * 2
+    data = [
+        torch.randn(4, 32, 64),
+        torch.randn(4, 32, 32)
+    ]
     mask = [torch.ones(4, 32, dtype=bool)] * 2
 
-    model = PerceiverIO(depth=2, dim=64, latent_dim=128, queries_dim=16, cross_attn_interval=[0, 1], seq_dropout_prob=0.25)
+    model = PerceiverIO(depth=2, dim=[64, 32], latent_dim=128, queries_dim=16, cross_attn_interval=[0, 1], seq_dropout_prob=0.25, rotary_pos_emb=True)
 
-    model(data, mask=mask)
+    model(data, queries=torch.randn(4, 16), mask=mask)
