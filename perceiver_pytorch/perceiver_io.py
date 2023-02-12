@@ -238,7 +238,8 @@ class PerceiverIO(nn.Module):
             assert len(dim) == len(self.cross_attn_indices)
             self.dims = dims = dim
         else:
-            self.dims = dims = [dim] * self.cross_attn_indices
+            if self.cross_attn_layers
+            self.dims = dims = [dim] * len(self.cross_attn_indices)
 
         for i in range(depth):
             if i in self.cross_attn_indices:
